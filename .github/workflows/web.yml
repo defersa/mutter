@@ -48,6 +48,7 @@ jobs:
           node-version: '22'
           package-manager-cache: false
       - run: node web/test/e2e.test.mjs
+      - run: node --test web/test/audio-receive.test.mjs
       - run: node web/test/e2e.test.mjs
         env:
           FAKE_VERSION: 1.4.287

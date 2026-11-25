@@ -24,3 +24,5 @@ Local.deploy.json
 *.key
 *.mobileprovision
 __pycache__/
+
+.idea

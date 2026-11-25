@@ -160,8 +160,16 @@ class Mixer extends AudioWorkletProcessor {
     this.lowWater = Infinity;
     this.playedThisSecond = false;
     this.capture = null;
+    this.diagnosticSession = null;
+    this.diagnosticRendered = 0;
+    this.diagnosticPeak = 0;
     this.port.onmessage = ({ data }) => {
       switch (data.type) {
+        case 'diagnostics':
+          this.diagnosticSession = data.session;
+          this.diagnosticRendered = 0;
+          this.diagnosticPeak = 0;
+          break;
         case 'push':
           this.push(data.session, data.samples);
           break;
@@ -246,6 +254,18 @@ class Mixer extends AudioWorkletProcessor {
   }
 
   reportHealth() {
+    if (this.diagnosticSession !== null) {
+      const user = this.users.get(this.diagnosticSession);
+      this.port.postMessage({
+        type: 'receive-health', session: this.diagnosticSession,
+        buffered: user ? this.available(user) : 0,
+        primed: user?.primed ?? false, ending: user?.ending ?? false,
+        gain: (user?.gain ?? 0) * this.master,
+        rendered: this.diagnosticRendered, peak: this.diagnosticPeak,
+      });
+      this.diagnosticRendered = 0;
+      this.diagnosticPeak = 0;
+    }
     const decision = this.policy.observe({
       underruns: this.underruns,
       lowWater: this.lowWater === Infinity ? null : this.lowWater,
@@ -274,7 +294,9 @@ class Mixer extends AudioWorkletProcessor {
     if (++this.tick >= TICKS_PER_SECOND) {
       this.reportHealth();
     }
+    const diagnosticUser = this.users.get(this.diagnosticSession);
     for (const user of this.users.values()) {
+      this.diagnosticUser = user === diagnosticUser;
       if (user.dryTicks !== null && ++user.dryTicks > UNDERRUN_CONFIRM_TICKS) {
         user.dryTicks = null;
         user.lowWater = Infinity;
@@ -327,6 +349,10 @@ class Mixer extends AudioWorkletProcessor {
         user.fadeIn--;
       }
       left[offset + i] += sample;
+      if (this.diagnosticUser) {
+        this.diagnosticRendered++;
+        this.diagnosticPeak = Math.max(this.diagnosticPeak, Math.abs(sample));
+      }
       user.lastSample = sample;
       user.read = (user.read + 1) % RING_SAMPLES;
     }

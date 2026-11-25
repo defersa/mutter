@@ -19,6 +19,7 @@ Start with the guide for the app you want to run: desktop, Mac, iOS, Android, or
 - [Phone layout](phone-layout.md): channels, chat, call controls, and settings.
 - [Design system](design.md): themes, fonts, color roles, and motion.
 - [Mumble protocol](protocol.md): connections, messages, and voice transport.
+- [Audio receive lifecycle](audio-receive.md): silent intervals, sequence restarts, diagnostics, and Windows checks.
 - [Screen sharing](screen-share.md): Mutter’s WebRTC extension.
 - [TURN setup](turn.md): helping video connect when a direct connection is blocked.
 - [Publishing the docs](publishing.md): preview the site and keep GitHub Pages up to date.

@@ -25,6 +25,10 @@ const CONCEAL_FLOOR = 0.4;
 const CONCEAL_FADE_SAMPLES = 96;
 const REORDER_WAIT_MS = 30;
 const MAX_REORDER_DEPTH = 1;
+// A sender may start a new sequence after silence without sending a terminator
+// (PyMumble resets its counter after five seconds). Packet ordering is scoped
+// to a talk spurt, not to the entire server connection.
+const RECEIVE_IDLE_MS = 2000;
 const OPUS_COMPLEXITY = 10;
 const EXPECTED_PACKET_LOSS_PERCENT = 10;
 
@@ -97,6 +101,7 @@ export class AudioEngine extends EventTarget {
   #encoder = null;
   #decoders = new Map();
   #receivers = new Map();
+  #receiveDiagnosticsSession = null;
   #gateOpen = false;
   #closing = false;
   #lastVoiceAt = 0;
@@ -220,6 +225,7 @@ export class AudioEngine extends EventTarget {
     }
     this.#decoders.clear();
     for (const receiver of this.#receivers.values()) {
+      this.#traceReceive(receiver, 'remove', 'reason=audio-stop', true);
       clearTimeout(receiver.flushTimer);
     }
     this.#receivers.clear();
@@ -360,6 +366,16 @@ export class AudioEngine extends EventTarget {
     });
   }
 
+  // Opt-in, session-scoped metadata only; no encoded audio or PCM is logged.
+  setReceiveDiagnostics(session = null) {
+    if (session !== null && (!Number.isSafeInteger(session) || session < 0)) {
+      throw new TypeError('Receive diagnostics needs a numeric session ID or null');
+    }
+    this.#receiveDiagnosticsSession = session;
+    this.#mixer?.port.postMessage({ type: 'diagnostics', session });
+    this.#diag(`receive diagnostics ${session === null ? 'off' : `session=${session}`}`);
+  }
+
   resync() {
     if (this.deafened) {
       this.client.setSelfDeaf(true);
@@ -372,7 +388,12 @@ export class AudioEngine extends EventTarget {
     this.#mixer = new AudioWorkletNode(this.#context, 'mutter-mixer', { outputChannelCount: [2] });
     this.#mixer.connect(this.#context.destination);
     this.#mixer.port.postMessage({ type: 'master', gain: this.deafened ? 0 : 1 });
+    this.#mixer.port.postMessage({ type: 'diagnostics', session: this.#receiveDiagnosticsSession });
     this.#mixer.port.onmessage = ({ data }) => {
+      if (data.type === 'receive-health') {
+        this.#diag(`receive session=${data.session} stage=render buffered=${data.buffered} primed=${data.primed} ending=${data.ending} rendered=${data.rendered} peak=${data.peak.toFixed(4)} gain=${data.gain} context=${this.#context?.state}`);
+        return;
+      }
       if (data.type === 'capture') {
         this.#captureResolve?.(data.samples);
         this.#captureResolve = null;
@@ -679,8 +700,27 @@ export class AudioEngine extends EventTarget {
       return;
     }
     const receiver = this.#receiverFor(packet.session);
+    receiver.received++;
     const sequence = Number(packet.frameNumber);
+    const now = performance.now();
+    const idleMs = receiver.lastPacketAt === null ? 0 : now - receiver.lastPacketAt;
+    if (idleMs >= RECEIVE_IDLE_MS) {
+      this.#traceReceive(receiver, 'restart', `idleMs=${Math.round(idleMs)} sequence=${sequence} previousNext=${receiver.nextSequence}`, true);
+      clearTimeout(receiver.flushTimer);
+      receiver.flushTimer = null;
+      receiver.pending.clear();
+      receiver.nextSequence = null;
+      receiver.lastSequence = null;
+      // Preserve the order of any in-flight decoder output. The break follows
+      // that output and precedes PCM from the new spurt; reuse the decoder.
+      receiver.queue.push({ broke: true });
+      this.#emitReady(receiver);
+    }
+    receiver.lastPacketAt = now;
+    this.#traceReceive(receiver, 'packet', `sequence=${sequence} bytes=${packet.opus.length} stereo=${Boolean(packet.opus[0] & 4)} terminator=${packet.isTerminator} context=${packet.context ?? 0}`);
     if (receiver.nextSequence !== null && sequence < receiver.nextSequence) {
+      receiver.dropped++;
+      this.#traceReceive(receiver, 'drop', `reason=late sequence=${sequence}`);
       return;
     }
     receiver.pending.set(sequence, packet);
@@ -693,6 +733,7 @@ export class AudioEngine extends EventTarget {
       return;
     }
     this.#drainPending(receiver, true);
+    this.#traceReceive(receiver, 'end', 'reason=empty-terminator', true);
     receiver.nextSequence = null;
     receiver.queue.push({ ending: true });
     this.#emitReady(receiver);
@@ -703,6 +744,8 @@ export class AudioEngine extends EventTarget {
     if (!receiver) {
       receiver = {
         session,
+        channelId: this.client.users.get(session)?.channelId,
+        localChannelId: this.client.users.get(this.client.me)?.channelId,
         nextSequence: null,
         lastSequence: null,
         lastPcm: null,
@@ -711,6 +754,12 @@ export class AudioEngine extends EventTarget {
         flushTimer: null,
         queue: [],
         fadeInNext: false,
+        lastPacketAt: null,
+        received: 0,
+        dropped: 0,
+        decoded: 0,
+        pushed: 0,
+        traceAt: {},
       };
       this.#receivers.set(session, receiver);
     }
@@ -773,15 +822,25 @@ export class AudioEngine extends EventTarget {
       return decoder;
     }
     decoder = new AudioDecoder({
-      output: (audio) => this.#onDecoded(session, audio),
+      output: (audio) => {
+        if (this.#decoders.get(session) !== decoder) {
+          audio.close();
+          return;
+        }
+        this.#onDecoded(session, audio);
+      },
       error: (error) => {
+        if (this.#decoders.get(session) !== decoder) return;
         this.#diag(`decoder ${session}: ${error.message}`);
+        const receiver = this.#receivers.get(session);
+        if (receiver) this.#traceReceive(receiver, 'error', `reason=decode name=${error.name}`, true);
         this.#decoders.delete(session);
         this.#receivers.get(session)?.queue.splice(0);
       },
     });
     decoder.configure({ codec: 'opus', sampleRate: SAMPLE_RATE, numberOfChannels: 1 });
     this.#decoders.set(session, decoder);
+    this.#traceReceive(this.#receivers.get(session), 'decoder', 'state=created channels=1', true);
     const user = this.client.users.get(session);
     const gain = user?.localMute ? 0 : (user?.localVolume ?? 1);
     this.#mixer?.port.postMessage({ type: 'gain', session, gain });
@@ -790,12 +849,21 @@ export class AudioEngine extends EventTarget {
 
   #onDecoded(session, audio) {
     const pcm = new Float32Array(audio.numberOfFrames);
+    const channels = audio.numberOfChannels;
     audio.copyTo(pcm, { planeIndex: 0, format: 'f32-planar' });
     audio.close();
     this.stats.samplesOut += pcm.length;
     const receiver = this.#receivers.get(session);
+    if (receiver) {
+      receiver.decoded++;
+      this.#traceReceive(receiver, 'decode', `frames=${pcm.length} channels=${channels}`);
+    }
     const waiting = receiver?.queue.find((item) => item.fills === undefined && item.pcm === null);
     if (!waiting) {
+      if (receiver) {
+        receiver.pushed += pcm.length;
+        this.#traceReceive(receiver, 'push', `frames=${pcm.length}`);
+      }
       this.#mixer?.port.postMessage({ type: 'push', session, samples: pcm }, [pcm.buffer]);
       return;
     }
@@ -845,6 +913,8 @@ export class AudioEngine extends EventTarget {
 
   #emitDecoded(receiver, item) {
     const pcm = item.pcm;
+    receiver.pushed += pcm.length;
+    this.#traceReceive(receiver, 'push', `frames=${pcm.length}`);
     receiver.unitsPerPacket = Math.max(1, Math.round(pcm.length / SAMPLES_PER_SEQUENCE_UNIT));
     if (receiver.fadeInNext) {
       fadeIn(pcm);
@@ -858,16 +928,29 @@ export class AudioEngine extends EventTarget {
   }
 
   #pruneDecoders() {
-    for (const session of [...this.#decoders.keys()]) {
-      if (this.client.users.has(session)) {
+    for (const session of this.#receivers.keys()) {
+      const receiver = this.#receivers.get(session);
+      const user = this.client.users.get(session);
+      if (user && user.channelId === receiver.channelId &&
+          this.client.users.get(this.client.me)?.channelId === receiver.localChannelId) {
         continue;
       }
       this.#closeQuietly(this.#decoders.get(session));
+      this.#traceReceive(receiver, 'remove', `reason=${user ? 'channel-changed' : 'user-left-server'}`, true);
       this.#decoders.delete(session);
       clearTimeout(this.#receivers.get(session)?.flushTimer);
       this.#receivers.delete(session);
       this.#mixer?.port.postMessage({ type: 'remove', session });
     }
+  }
+
+  #traceReceive(receiver, stage, detail, force = false) {
+    if (!receiver || receiver.session !== this.#receiveDiagnosticsSession) return;
+    const now = performance.now();
+    if (!force && now - (receiver.traceAt[stage] ?? -Infinity) < 1000) return;
+    receiver.traceAt[stage] = now;
+    const decoder = this.#decoders.get(receiver.session);
+    this.#diag(`receive session=${receiver.session} stage=${stage} ${detail} received=${receiver.received} dropped=${receiver.dropped} decoded=${receiver.decoded} submitted=${receiver.pushed} next=${receiver.nextSequence} pending=${receiver.pending.size} queue=${receiver.queue.length} decoder=${decoder?.state ?? 'none'} decodeQueue=${decoder?.decodeQueueSize ?? 0} context=${this.#context?.state}`);
   }
 
   #closeQuietly(codec) {

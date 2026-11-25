@@ -182,4 +182,25 @@ assert.equal(underrunsCounted(midStreamGap), 1);
 assert.equal(midStreamGap.policy.target, FRAME * 4);
 console.log(' ok  a gap in the middle of speech still counts as an underrun and grows the buffer');
 
+const traced = startMixer();
+speak(traced, 60);
+assert.equal(traced.port.sent.some(message => message.type === 'receive-health'), false);
+send(traced, { type: 'diagnostics', session: SPEAKER });
+send(traced, { type: 'gain', session: SPEAKER, gain: 0.5 });
+speak(traced, 60);
+const playing = traced.port.sent.filter(message => message.type === 'receive-health');
+assert.ok(playing.some(message => message.rendered > 0 && message.peak > 0 && message.gain === 0.5));
+assert.ok(playing.every(message => message.session === SPEAKER && !('samples' in message)));
+send(traced, { type: 'remove', session: SPEAKER });
+render(traced, 1100);
+const removed = traced.port.sent.filter(message => message.type === 'receive-health').at(-1);
+assert.equal(removed.buffered, 0);
+assert.equal(removed.primed, false);
+assert.equal(removed.gain, 0);
+send(traced, { type: 'diagnostics', session: null });
+const reports = traced.port.sent.filter(message => message.type === 'receive-health').length;
+render(traced, 1100);
+assert.equal(traced.port.sent.filter(message => message.type === 'receive-health').length, reports);
+console.log(' ok  per-user render diagnostics are opt-in, report signal and gain, and stop when disabled');
+
 console.log('\nPASS');

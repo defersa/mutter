@@ -60,6 +60,27 @@ npm run dist:win     # portable + per-user installer into desktop/dist (run this
 
 Windows targets can only be built on Windows without `wine`; macOS targets only on macOS.
 
+When cross-building Windows x64 on Linux/macOS with Wine, a rebuild can fail with
+`node-gyp does not support cross-compiling native modules from source`. With the
+current locked dependencies, `uiohook-napi` already ships a Node-API Windows x64
+binary, so this build can use it without rebuilding native dependencies:
+
+```sh
+test -f node_modules/uiohook-napi/prebuilds/win32-x64/uiohook-napi.node
+npm run dist:win -- --x64 --publish never -c.npmRebuild=false
+```
+
+Run these commands from `desktop/`, after `npm ci`. Wine must be available to
+electron-builder. This override is specific to the current prebuilt dependencies;
+check the target binaries again if native dependencies change. Keep native rebuilds
+enabled for the ordinary platform builds.
+
+The current `@electron/rebuild` prebuildify matcher looks for names such as
+`node.napi.node` and `electron.napi.node`, while `uiohook-napi@1.5.5` ships
+`prebuilds/win32-x64/uiohook-napi.node`. A clean cross-build can therefore fall back
+to node-gyp despite having a usable binary. The runtime's `node-gyp-build` loader
+accepts the shipped filename.
+
 The capture test needs Chromium (`CHROME` can select its executable). On Linux X11, use a
 private, local-only display without an Xauthority file:
 
